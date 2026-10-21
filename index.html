@@ -934,7 +934,6 @@ function renderCta() {
   else if (app.phase === 'done') label = `${ICON.check}${app.dry ? 'Test sent' : 'Printed'}`;
   else if (!printer.connected) label = `${ICON.bt}${app.everConnected ? 'Reconnect' : 'Connect camera'}`;
   else if (!img) label = `${ICON.photo}Choose a photo`;
-  else if (!app.dry && app.info?.filmLeft === 0) { label = 'Out of film'; disabled = true; }
   else label = `${ICON.print}${app.dry ? 'Send test' : 'Print'}`;
 
   $('ctaLabel').innerHTML = label;
@@ -980,7 +979,7 @@ function renderNote() {
   }
   if (!printer.connected) { note.textContent = 'Turn on your camera, then connect.'; return; }
   if (app.dry) { note.textContent = 'Test mode is on, so no film will be used.'; return; }
-  if (i?.filmLeft === 0) { note.textContent = 'Load a new film pack, then reconnect.'; return; }
+  if (i?.filmLeft === 0) { note.textContent = 'The camera reports no film. Print checks again, or load a new pack.'; return; }
   if (i?.battery != null && i.battery <= 15 && !i.charging) { note.textContent = `Battery is low (${i.battery}%). Charge the camera soon.`; return; }
   if (img) { note.textContent = 'Drag to frame · pinch to zoom · double-tap to reset'; return; }
   note.textContent = `${i?.filmLeft ?? '–'} shots left`;
@@ -1023,6 +1022,23 @@ printer.addEventListener('disconnected', () => {
   if (app.phase === 'idle') render();
 });
 
+// While a sheet is still printing and ejecting, the camera can report 0 shots left.
+// Poll until it reports what we expect (or something believable), and don't let a
+// lingering 0 overwrite a count we know is higher.
+async function settleFilmCount(expected) {
+  let last = null;
+  for (let i = 0; i < 8; i++) {
+    try { last = await printer.status(); } catch { last = null; }
+    if (last && (expected == null || last.filmLeft === expected || (last.filmLeft > 0 && i > 0))) break;
+    await sleep(2500);
+  }
+  if (last) Object.assign(app.info, last);
+  if (expected != null && (!last || (last.filmLeft === 0 && expected > 0))) {
+    log(`Camera reports ${last?.filmLeft ?? 'nothing'} shots after printing; showing the expected ${expected}`);
+    app.info.filmLeft = expected;
+  }
+}
+
 let wakeLock = null;
 async function holdScreen(on) {
   try {
@@ -1034,6 +1050,16 @@ async function holdScreen(on) {
 async function print() {
   const dry = app.dry;
   const film = $('film');
+  // A 0 can be a stale mid-print reading, so ask the camera again before believing it.
+  if (!dry && app.info?.filmLeft === 0) {
+    try { Object.assign(app.info, await printer.status()); } catch {}
+    if (app.info?.filmLeft === 0) {
+      app.error = { text: 'The camera reports no film left. Load a new pack and try again.' };
+      render();
+      return;
+    }
+  }
+  const filmBefore = app.info?.filmLeft ?? null;
   app.phase = 'sending'; app.progress = 0; app.error = null; app.flash = null; app.retrying = false;
   $('scan').style.setProperty('--p', '0%');
   film.classList.add('sending');
@@ -1082,8 +1108,9 @@ async function print() {
     if (res.printed) {
       app.phase = 'printing'; render();
       film.classList.remove('done'); void film.offsetWidth; film.classList.add('printing');
+      const expected = filmBefore != null ? Math.max(0, filmBefore - 1) : null;
       await sleep(DEMO ? 7200 : 10000);
-      try { Object.assign(app.info, await printer.status()); } catch {}
+      await settleFilmCount(expected);
     }
     app.phase = 'done';
     const left = app.info?.filmLeft;
