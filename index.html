@@ -393,7 +393,25 @@ const MODELS = { HM1: 'instax mini LiPlay', FI017: 'instax mini Link', FI018: 'i
 
 // LiPlay negotiates an ATT MTU of 185, so a single write carries at most 182 bytes.
 const WRITE_SIZE = 182;
-const DEFAULT_MAX_JPEG = 105 * 1024;
+// The official Android app keeps photos under ~65 KB. Smaller transfers finish sooner and
+// leave fewer chances for a dropped write, with no visible loss at 600x800.
+const DEFAULT_MAX_JPEG = 64 * 1024;
+
+// How image data is pushed, from fastest to safest. iOS silently drops
+// write-without-response packets when its buffer fills, so a stalled transfer is
+// retried with pacing, then with acknowledged writes.
+// The small sizes cover a link that negotiated the minimum 23-byte MTU, where a
+// 182-byte write can't get through at all.
+const PACES = [
+  { name: 'fast', size: WRITE_SIZE, withResponse: false, gap: 0 },
+  { name: 'paced', size: WRITE_SIZE, withResponse: false, gap: 20 },
+  { name: 'acknowledged', size: WRITE_SIZE, withResponse: true, gap: 0 },
+  { name: 'small', size: 20, withResponse: false, gap: 6 },
+  { name: 'small acknowledged', size: 20, withResponse: true, gap: 0 },
+];
+
+// A refusal from the camera itself; retrying the same photo won't change its answer.
+class CameraRefusal extends Error {}
 
 const hex = (bytes) => Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join(' ');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -424,6 +442,7 @@ class InstaxPrinter extends EventTarget {
     this.waiter = null;
     this.chain = Promise.resolve();
     this.verbose = false;
+    this.pace = 0;
     this.handleNotify = (e) => this.onData(e.target.value);
   }
 
@@ -524,22 +543,32 @@ class InstaxPrinter extends EventTarget {
   async requestNow(op, payload, timeout) {
     if (!this.connected) throw new Error('Camera is not connected');
     const frame = encodeFrame(op, payload);
-    const reply = new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        if (this.waiter?.timer === timer) this.waiter = null;
-        reject(new Error(`No reply to ${OP_NAMES[op]} after ${timeout / 1000}s`));
-      }, timeout);
-      this.waiter = { op, resolve, reject, timer };
-    });
+    // The waiter is armed before writing so an instant reply can't be missed, but the
+    // timeout only starts once every byte is out: slow paces take seconds per chunk.
+    const waiter = { op, timer: null };
+    const reply = new Promise((resolve, reject) => Object.assign(waiter, { resolve, reject }));
     reply.catch(() => {});
+    this.waiter = waiter;
     if (this.verbose || op !== OP.DOWNLOAD_DATA) {
       this.log(`-> ${OP_NAMES[op]} ${frame.length > 40 ? `(${frame.length} bytes)` : hex(frame)}`);
     }
-    for (let i = 0; i < frame.length; i += WRITE_SIZE) {
-      const part = frame.subarray(i, i + WRITE_SIZE);
-      if (this.write.writeValueWithoutResponse) await this.write.writeValueWithoutResponse(part);
-      else await this.write.writeValue(part);
+    const pace = PACES[this.pace];
+    try {
+      for (let i = 0; i < frame.length; i += pace.size) {
+        const part = frame.subarray(i, i + pace.size);
+        if (pace.withResponse) await (this.write.writeValueWithResponse ?? this.write.writeValue).call(this.write, part);
+        else if (this.write.writeValueWithoutResponse) await this.write.writeValueWithoutResponse(part);
+        else await this.write.writeValue(part);
+        if (pace.gap && i + pace.size < frame.length) await sleep(pace.gap);
+      }
+    } catch (e) {
+      if (this.waiter === waiter) this.waiter = null;
+      throw e;
     }
+    waiter.timer = setTimeout(() => {
+      if (this.waiter === waiter) this.waiter = null;
+      waiter.reject(new Error(`No reply to ${OP_NAMES[op]} after ${timeout / 1000}s`));
+    }, timeout);
     const r = await reply;
     if (this.verbose || op !== OP.DOWNLOAD_DATA) this.log(`<- ${OP_NAMES[r.op]} status=${r.status} ${hex(r.data)}`);
     return r;
@@ -586,17 +615,56 @@ class InstaxPrinter extends EventTarget {
     try { await this.request(OP.DOWNLOAD_CANCEL, [], 3000); } catch (e) { this.log(`cancel: ${e.message}`); }
   }
 
-  // Send the JPEG and (optionally) print it. onProgress(fraction, label)
-  async printJpeg(jpeg, { dryRun = false, onProgress = () => {} } = {}) {
-    onProgress(0, 'Starting transfer…');
-    let start;
-    try {
-      start = await this.request(OP.DOWNLOAD_START, [0x02, 0x00, 0x00, 0x00, ...u32(jpeg.length)], 8000);
-    } catch (e) {
-      if (!this.connected) throw e;
-      throw new Error('The camera didn’t respond. Put it on the shooting screen and try again.');
+  // Send the JPEG and (optionally) print it. onProgress(fraction); onRetry(paceName) before a slower retry.
+  async printJpeg(jpeg, { dryRun = false, onProgress = () => {}, onRetry = () => {} } = {}) {
+    for (;;) {
+      try {
+        await this.transfer(jpeg, onProgress);
+        break;
+      } catch (e) {
+        if (e instanceof CameraRefusal || !this.connected) throw e;
+        this.log(`Transfer stalled at ${PACES[this.pace].name} pace: ${e.message}`);
+        // Give the camera time to give up on any half-received frame before cancelling.
+        await sleep(1500);
+        await this.cancel();
+        if (this.pace >= PACES.length - 1) throw new Error('The camera stopped responding while receiving the photo.');
+        this.pace++;
+        this.log(`Retrying at ${PACES[this.pace].name} pace`);
+        onRetry(PACES[this.pace].name);
+        onProgress(0);
+        await sleep(800);
+      }
     }
-    if (start.status !== 0) throw new Error(describeStatus(start.status, 'start'));
+
+    if (dryRun) {
+      // The camera now holds the photo and waits for PRINT_IMAGE; tell it to drop it.
+      await this.cancel();
+      onProgress(1);
+      return { printed: false };
+    }
+
+    onProgress(0.93);
+    const pr = await this.request(OP.PRINT_IMAGE, [], 20000);
+    if (pr.status !== 0) throw new CameraRefusal(describeStatus(pr.status, 'print'));
+    onProgress(1);
+    return { printed: true };
+  }
+
+  async transfer(jpeg, onProgress) {
+    onProgress(0);
+    let start;
+    // A camera still tidying up after a cancelled transfer answers "busy" briefly.
+    for (let tries = 0; ; tries++) {
+      try {
+        start = await this.request(OP.DOWNLOAD_START, [0x02, 0x00, 0x00, 0x00, ...u32(jpeg.length)], 8000);
+      } catch (e) {
+        if (!this.connected) throw e;
+        throw new CameraRefusal('The camera didn’t respond. Put it on the shooting screen and try again.');
+      }
+      if (start.status === 0x01 && tries < 3) { await sleep(1500); continue; }
+      break;
+    }
+    if (start.status !== 0) throw new CameraRefusal(describeStatus(start.status, 'start'));
 
     // The printer answers DOWNLOAD_START with the chunk size it wants.
     // Fall back to 1808 (seen in LiPlay captures) if the reply is short.
@@ -607,33 +675,21 @@ class InstaxPrinter extends EventTarget {
     const count = Math.ceil(jpeg.length / chunk);
     this.log(`Sending ${jpeg.length} bytes as ${count} chunks of ${chunk}`);
 
-    try {
-      for (let i = 0; i < count; i++) {
-        const piece = new Uint8Array(chunk); // last chunk zero-padded
-        piece.set(jpeg.subarray(i * chunk, (i + 1) * chunk));
-        const r = await this.request(OP.DOWNLOAD_DATA, [...u32(i), ...piece], 8000);
-        if (r.status !== 0) throw new Error(describeStatus(r.status, 'data') + ` (chunk ${i + 1}/${count})`);
-        onProgress((i + 1) / count * 0.9, `Sending photo… ${i + 1}/${count}`);
+    for (let i = 0; i < count; i++) {
+      const piece = new Uint8Array(chunk); // last chunk zero-padded
+      piece.set(jpeg.subarray(i * chunk, (i + 1) * chunk));
+      let r;
+      try {
+        r = await this.request(OP.DOWNLOAD_DATA, [...u32(i), ...piece], 6000);
+      } catch (e) {
+        throw new Error(`no reply to chunk ${i + 1}/${count}`);
       }
-      const end = await this.request(OP.DOWNLOAD_END, [], 8000);
-      if (end.status !== 0) throw new Error(describeStatus(end.status, 'end'));
-    } catch (e) {
-      await this.cancel();
-      throw e;
+      if (r.status !== 0) throw new Error(describeStatus(r.status, 'data') + ` (chunk ${i + 1}/${count})`);
+      if (i === 0) this.log(`Chunk 1 acknowledged at ${PACES[this.pace].name} pace`);
+      onProgress((i + 1) / count * 0.9);
     }
-
-    if (dryRun) {
-      // The camera now holds the photo and waits for PRINT_IMAGE; tell it to drop it.
-      await this.cancel();
-      onProgress(1, 'Transfer finished. Test mode, so nothing was printed.');
-      return { printed: false };
-    }
-
-    onProgress(0.93, 'Printing…');
-    const pr = await this.request(OP.PRINT_IMAGE, [], 20000);
-    if (pr.status !== 0) throw new Error(describeStatus(pr.status, 'print'));
-    onProgress(1, 'Printing… the photo should be coming out now.');
-    return { printed: true };
+    const end = await this.request(OP.DOWNLOAD_END, [], 8000);
+    if (end.status !== 0) throw new Error(describeStatus(end.status, 'end'));
   }
 }
 
@@ -696,6 +752,8 @@ const BLUEFY_URL = 'https://apps.apple.com/app/id1492822055';
 const SUPPORTED = DEMO || (window.isSecureContext && !!navigator.bluetooth);
 
 const printer = DEMO ? new DemoPrinter(log) : new InstaxPrinter(log);
+// Start from the write pace that last worked on this device.
+printer.pace = Math.min(PACES.length - 1, Math.max(0, store.get('pace', 0) | 0));
 const app = {
   phase: 'idle',       // idle | connecting | sending | printing | done
   info: null,
@@ -871,7 +929,11 @@ function renderNote() {
   }
   if (app.flash) { note.textContent = app.flash; return; }
   const i = app.info;
-  if (app.phase !== 'idle') { note.textContent = app.phase === 'printing' ? 'Your photo is developing.' : 'Keep the camera close.'; return; }
+  if (app.phase !== 'idle') {
+    note.textContent = app.phase === 'printing' ? 'Your photo is developing.'
+      : app.retrying ? 'Bluetooth hiccup. Resending more carefully…' : 'Keep the camera close.';
+    return;
+  }
   if (!printer.connected) { note.textContent = 'Turn on your camera, then connect.'; return; }
   if (app.dry) { note.textContent = 'Test mode is on, so no film will be used.'; return; }
   if (i?.filmLeft === 0) { note.textContent = 'Load a new film pack, then reconnect.'; return; }
@@ -928,7 +990,7 @@ async function holdScreen(on) {
 async function print() {
   const dry = app.dry;
   const film = $('film');
-  app.phase = 'sending'; app.progress = 0; app.error = null; app.flash = null;
+  app.phase = 'sending'; app.progress = 0; app.error = null; app.flash = null; app.retrying = false;
   $('scan').style.setProperty('--p', '0%');
   film.classList.add('sending');
   render();
@@ -945,8 +1007,10 @@ async function print() {
         $('scan').style.setProperty('--p', `${Math.min(100, f / 0.9 * 100)}%`);
         renderCta();
       },
+      onRetry: () => { app.retrying = true; renderNote(); pulse(film, 'shake'); },
     });
     log(`Sent in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+    if (!DEMO) store.set('pace', printer.pace);
 
     film.classList.remove('sending');
     if (res.printed) {
@@ -963,7 +1027,9 @@ async function print() {
     await sleep(2000);
   } catch (e) {
     log(`Print failed: ${e.message}`);
-    app.error = { text: e.message, help: !printer.connected || /respond|shooting|refused/i.test(e.message) };
+    const low = app.info?.battery != null && app.info.battery <= 20 && !app.info.charging;
+    const text = !printer.connected ? 'The camera disconnected. Reconnect and try again.' : e.message;
+    app.error = { text: low ? `${text} Its battery is low (${app.info.battery}%). Charge it and try again.` : text, help: true };
     film.classList.remove('sending');
     pulse(film, 'shake');
   } finally {
