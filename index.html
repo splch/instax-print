@@ -431,6 +431,9 @@ function encodeFrame(op, payload = []) {
   return f;
 }
 
+// Bluefy rejects with non-Error values; make whatever was thrown readable in the log.
+const errorText = (e) => e?.message ?? (typeof e === 'string' ? e : JSON.stringify(e) ?? String(e));
+
 const u32 = (n) => [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255];
 
 class InstaxPrinter extends EventTarget {
@@ -471,7 +474,7 @@ class InstaxPrinter extends EventTarget {
         return;
       } catch (e) {
         lastError = e;
-        this.log(`Attempt ${attempt} failed: ${e.name}: ${e.message}`);
+        this.log(`Attempt ${attempt} failed: ${e?.name ?? 'error'}: ${errorText(e)}`);
         if (this.device.gatt.connected) this.device.gatt.disconnect();
         await sleep(1500);
       }
@@ -557,7 +560,9 @@ class InstaxPrinter extends EventTarget {
     const pace = PACES[this.pace];
     try {
       for (let i = 0; i < frame.length; i += pace.size) {
-        const part = frame.subarray(i, i + pace.size);
+        // A copy, not a subarray view: some Web Bluetooth bridges (Bluefy on iOS) send the
+        // view's whole underlying buffer, so only single-write commands arrived intact.
+        const part = frame.slice(i, i + pace.size);
         if (pace.withResponse) await (this.write.writeValueWithResponse ?? this.write.writeValue).call(this.write, part);
         else if (this.write.writeValueWithoutResponse) await this.write.writeValueWithoutResponse(part);
         else await this.write.writeValue(part);
@@ -652,6 +657,8 @@ class InstaxPrinter extends EventTarget {
           this.log(`Retrying at ${PACES[this.pace].name} pace`);
           onRetry(PACES[this.pace].name);
         } else {
+          // Not one chunk got through at any pace, so a smaller file wouldn't help either.
+          if (acked === 0) throw new Error('The camera isn’t accepting photo data from this device. Copy the log from ⋯ and share it.');
           // A lighter file is the last resort: every pace failed, or the camera's memory is full.
           if (sizeLimited && this.pace > 0) this.pace--; // the slower pace wasn't the fix
           const smaller = await shrink('stalled', jpeg.length, acked);
@@ -712,7 +719,8 @@ class InstaxPrinter extends EventTarget {
       try {
         r = await this.request(OP.DOWNLOAD_DATA, [...u32(i), ...piece], 6000);
       } catch (e) {
-        throw Object.assign(new Error(`no reply to chunk ${i + 1}/${count}`), { acked: i * chunk });
+        const why = /^No reply/.test(e?.message) ? 'no reply' : `write failed (${errorText(e)})`;
+        throw Object.assign(new Error(`${why} on chunk ${i + 1}/${count}`), { acked: i * chunk });
       }
       if (r.status !== 0) throw new Error(describeStatus(r.status, 'data') + ` (chunk ${i + 1}/${count})`);
       if (i === 0) this.log(`Chunk 1 acknowledged at ${PACES[this.pace].name} pace`);
@@ -893,7 +901,7 @@ function render() {
   $('sDots').innerHTML = i?.filmLeft != null ? Array.from({ length: 10 }, (_, n) => `<i class="${n < i.filmLeft ? 'on' : ''}" style="--i:${n}"></i>`).join('') : '';
   $('sBatt').textContent = i?.battery != null ? `${i.battery}%${i.charging ? ' · charging' : ''}` : '–';
   $('camActions').hidden = !on;
-  const limit = store.get('sizeLimit', null);
+  const limit = store.get('limit', null);
   const pace = store.get('pace', 0);
   $('sLearned').textContent = !limit && !pace ? 'Full quality, fastest sending'
     : `${PACES[pace]?.name ?? 'fast'} sending${limit ? ` · photos under ${Math.round(limit / 1024)} KB` : ' · full quality'}`;
@@ -1035,7 +1043,7 @@ async function print() {
     app.preparing = true; renderCta();
     const enc = new PhotoEncoder();
     // Start under any limit the camera has stated or shown before; otherwise no limit.
-    const known = Math.min(app.info?.maxJpeg ?? Infinity, store.get('sizeLimit', null) ?? Infinity);
+    const known = Math.min(app.info?.maxJpeg ?? Infinity, store.get('limit', null) ?? Infinity);
     let current = await enc.best(known);
     log(`Encoded ${OUT.w}x${OUT.h}: ${describeEncoding(current)}`);
     app.preparing = false; renderCta();
@@ -1044,7 +1052,7 @@ async function print() {
       // A stall tens of KB in looks like the camera's memory filling up: go straight
       // under that point (and remember it) rather than stepping down through slow failures.
       const memory = acked >= 32 * 1024 ? acked : Infinity;
-      if (!DEMO) store.set('sizeLimit', Math.min(size - 1, memory));
+      if (!DEMO && (reason === 'too-large' || memory !== Infinity)) store.set('limit', Math.min(size - 1, memory));
       const budget = Math.min(Math.floor(size * SHRINK_STEP), Math.floor(memory * 0.95));
       const next = await enc.best(budget);
       if (!next.fits || next.fidelity < PRINT_FIDELITY_FLOOR) {
@@ -1119,7 +1127,7 @@ $('refresh').onclick = async () => {
   render();
 };
 $('disconnect').onclick = () => { printer.disconnect(); sheet.close(); };
-$('resetLearned').onclick = () => { store.set('sizeLimit', null); store.set('pace', 0); if (!DEMO) printer.pace = 0; render(); };
+$('resetLearned').onclick = () => { store.set('limit', null); store.set('pace', 0); if (!DEMO) printer.pace = 0; render(); };
 $('copylog').onclick = (e) => { e.preventDefault(); navigator.clipboard?.writeText(logEl.textContent); e.target.textContent = 'Copied'; setTimeout(() => (e.target.textContent = 'Copy'), 1500); };
 document.querySelectorAll('[data-bg]').forEach((b) => b.onclick = () => { view.bg = b.dataset.bg; store.set('bg', view.bg); draw(); updateThumbs(); render(); });
 
