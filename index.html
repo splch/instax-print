@@ -1,0 +1,784 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Instax Print</title>
+<style>
+  :root {
+    --bg: #f4f1ec;
+    --panel: #ffffff;
+    --ink: #1f1d1a;
+    --muted: #6d675e;
+    --line: #e2ddd4;
+    --accent: #e0503c;
+    --accent-ink: #ffffff;
+    --ok: #2f8a4c;
+    --warn: #b7791f;
+    --err: #c53030;
+    --film: #fbfaf7;
+    --stage: #e9e4dc;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #171614; --panel: #22201d; --ink: #f1ede6; --muted: #a39b8f; --line: #36322d;
+      --accent: #f0654f; --film: #f6f4ef; --stage: #2b2824;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #171614; --panel: #22201d; --ink: #f1ede6; --muted: #a39b8f; --line: #36322d;
+    --accent: #f0654f; --film: #f6f4ef; --stage: #2b2824;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  }
+  header { padding: 22px 16px 6px; max-width: 1080px; margin: 0 auto; }
+  header h1 { margin: 0; font-size: 22px; letter-spacing: -0.01em; }
+  header p { margin: 4px 0 0; color: var(--muted); }
+  main {
+    max-width: 1080px; margin: 0 auto; padding: 16px;
+    display: grid; grid-template-columns: 320px 1fr; gap: 16px; align-items: start;
+  }
+  @media (max-width: 820px) { main { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px; }
+  .card h2 { margin: 0 0 12px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+  .banner { max-width: 1080px; margin: 8px auto 0; padding: 0 16px; }
+  .banner div { border-radius: 10px; padding: 10px 14px; background: #fff3cd; color: #5c4400; border: 1px solid #f0d78c; }
+  button {
+    font: inherit; border-radius: 10px; border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+    padding: 9px 14px; cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--muted); }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
+  button.primary:hover:not(:disabled) { filter: brightness(1.05); border-color: var(--accent); }
+  button.wide { width: 100%; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  dl.stats { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; margin: 14px 0 0; }
+  dl.stats dt { color: var(--muted); }
+  dl.stats dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 6px; vertical-align: 1px; }
+  .dot.on { background: var(--ok); }
+  .dot.busy { background: var(--warn); }
+  .meter { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; margin-top: 4px; }
+  .meter > i { display: block; height: 100%; width: 0; background: var(--ok); transition: width .2s; }
+  .hint { color: var(--muted); font-size: 13px; margin: 12px 0 0; }
+  .hint ol { margin: 6px 0 0; padding-left: 18px; }
+
+  .editor { display: grid; grid-template-columns: auto 1fr; gap: 20px; }
+  @media (max-width: 640px) { .editor { grid-template-columns: 1fr; } }
+  .stage {
+    background: var(--stage); border-radius: 12px; padding: 22px; display: grid; place-items: center;
+    min-width: 280px;
+  }
+  /* instax mini film: 54 x 86 mm sheet, 46 x 62 mm image */
+  .film {
+    background: var(--film); width: 264px; padding: 18px 18px 60px; border-radius: 4px;
+    box-shadow: 0 1px 2px rgba(0,0,0,.12), 0 8px 24px rgba(0,0,0,.14);
+  }
+  .film canvas {
+    display: block; width: 228px; height: 304px; background: #111; touch-action: none; cursor: grab;
+  }
+  .film canvas.dragging { cursor: grabbing; }
+  @media (max-width: 420px) {
+    main { padding: 12px; }
+    .card { padding: 14px; }
+    .stage { padding: 14px; min-width: 0; }
+  }
+  .drop {
+    border: 2px dashed var(--line); border-radius: 12px; padding: 18px; text-align: center; color: var(--muted);
+    cursor: pointer;
+  }
+  .drop.over { border-color: var(--accent); color: var(--ink); }
+  .controls { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+  label.slider { display: grid; grid-template-columns: 92px 1fr 40px; align-items: center; gap: 8px; font-size: 14px; }
+  label.slider output { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .seg button { border: 0; border-radius: 0; padding: 7px 12px; }
+  .seg button[aria-pressed=true] { background: var(--ink); color: var(--panel); }
+  .check { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+
+  .printbar { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 16px; }
+  .progress { height: 10px; border-radius: 5px; background: var(--line); overflow: hidden; margin: 12px 0 6px; }
+  .progress > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .15s; }
+  #status { min-height: 1.4em; }
+  #status.err { color: var(--err); }
+  #status.ok { color: var(--ok); }
+
+  details.log { margin-top: 16px; }
+  details.log summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+  #log {
+    font: 12px/1.5 var(--mono); background: var(--stage); border-radius: 8px; padding: 10px; margin-top: 8px;
+    max-height: 260px; overflow: auto; white-space: pre-wrap; word-break: break-all;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Instax Print</h1>
+  <p>Print to an instax mini LiPlay (or Link printer) over Bluetooth, straight from a computer or phone.</p>
+</header>
+<div class="banner" id="support" hidden><div></div></div>
+
+<main>
+  <section class="card">
+    <h2>Camera</h2>
+    <div class="row">
+      <button class="primary wide" id="connect">Connect</button>
+      <button class="wide" id="disconnect" hidden>Disconnect</button>
+    </div>
+    <dl class="stats">
+      <dt>Status</dt><dd><span class="dot" id="dot"></span><span id="conn">Not connected</span></dd>
+      <dt>Device</dt><dd id="name">–</dd>
+      <dt>Model</dt><dd id="model">–</dd>
+      <dt>Film left</dt><dd id="film">–</dd>
+      <dt>Battery</dt><dd><span id="batt">–</span><div class="meter"><i id="battbar"></i></div></dd>
+      <dt>Image size</dt><dd id="size">–</dd>
+    </dl>
+    <div class="hint">
+      Before connecting:
+      <ol>
+        <li>Turn the LiPlay on and keep it awake.</li>
+        <li>Close the instax app on your phone (or turn the phone's Bluetooth off). The camera takes only one connection.</li>
+        <li>If the camera doesn't appear or won't connect, delete the registration in the camera's Bluetooth menu, and forget the INSTAX device in this computer's or phone's Bluetooth settings. Both sides must start fresh.</li>
+        <li>In the picker, choose the entry ending in <b>(IOS)</b>. That is the BLE endpoint the browser can reach.</li>
+        <li>Once connected, put the camera back on the shooting screen (not the menu) before printing.</li>
+      </ol>
+    </div>
+    <button id="refresh" class="wide" style="margin-top:12px" disabled>Refresh status</button>
+  </section>
+
+  <section class="card">
+    <h2>Photo</h2>
+    <div class="editor">
+      <div class="stage">
+        <div class="film"><canvas id="preview" width="600" height="800" aria-label="Print preview, drag to reposition"></canvas></div>
+      </div>
+      <div class="controls">
+        <div class="drop" id="drop">Drop a photo here, paste one, or <u>choose a file</u>
+          <input type="file" id="file" accept="image/*" hidden>
+        </div>
+        <label class="slider">Zoom <input type="range" id="zoom" min="1" max="4" step="0.01" value="1"><output id="zoomv">1.0×</output></label>
+        <label class="slider">Brightness <input type="range" id="bright" min="70" max="140" value="100"><output id="brightv">100</output></label>
+        <label class="slider">Contrast <input type="range" id="contrast" min="70" max="140" value="100"><output id="contrastv">100</output></label>
+        <label class="slider">Saturation <input type="range" id="sat" min="0" max="160" value="100"><output id="satv">100</output></label>
+        <div class="row" style="align-items:center">
+          <div class="seg" role="group" aria-label="Fit">
+            <button id="fill" aria-pressed="true">Fill</button>
+            <button id="fit" aria-pressed="false">Fit</button>
+          </div>
+          <button id="rotate" title="Rotate 90°">Rotate ↻</button>
+          <button id="reset">Reset</button>
+        </div>
+        <div class="row" style="align-items:center">
+          <span style="color:var(--muted);font-size:14px">Border fill</span>
+          <div class="seg" role="group" aria-label="Background">
+            <button data-bg="#ffffff" aria-pressed="true">White</button>
+            <button data-bg="#000000" aria-pressed="false">Black</button>
+          </div>
+        </div>
+        <p class="hint" style="margin:0">Drag the photo to reposition it. Pinch or scroll to zoom. Instax prints come out a little dark, so +5–10 brightness often helps.</p>
+      </div>
+    </div>
+
+    <div class="printbar">
+      <div class="row" style="align-items:center;justify-content:space-between">
+        <label class="check"><input type="checkbox" id="dry" checked> Test transfer only (don't use film)</label>
+        <button class="primary" id="print" disabled>Print</button>
+      </div>
+      <div class="progress"><i id="bar"></i></div>
+      <div id="status">Connect the camera and pick a photo.</div>
+    </div>
+
+    <details class="log">
+      <summary>Bluetooth log</summary>
+      <div id="log"></div>
+      <div class="row" style="margin-top:8px">
+        <button id="copylog">Copy log</button>
+        <label class="check"><input type="checkbox" id="verbose"> Log every packet</label>
+      </div>
+    </details>
+  </section>
+</main>
+
+<script>
+'use strict';
+
+// ---------------------------------------------------------------------------
+// Instax BLE protocol (same family as the Mini/Square/Wide Link printers)
+//   frame: 'A' 'b' | len(2, BE, whole frame) | op(2) | payload | checksum
+//   reply: 'a' 'B' | len(2) | op(2) | status(1) | payload | checksum
+//   checksum makes the byte sum of the frame == 0xFF (mod 256)
+// ---------------------------------------------------------------------------
+const SERVICE = '70954782-2d83-473d-9e5f-81e1d02d5273';
+const WRITE_CHAR = '70954783-2d83-473d-9e5f-81e1d02d5273';
+const NOTIFY_CHAR = '70954784-2d83-473d-9e5f-81e1d02d5273';
+const OPTIONAL_SERVICES = [SERVICE, '0000180a-0000-1000-8000-00805f9b34fb'];
+
+const OP = {
+  DEVICE_INFO: 0x0001,
+  FUNCTION_INFO: 0x0002,
+  DOWNLOAD_START: 0x1000,
+  DOWNLOAD_DATA: 0x1001,
+  DOWNLOAD_END: 0x1002,
+  DOWNLOAD_CANCEL: 0x1003,
+  PRINT_IMAGE: 0x1080,
+};
+const OP_NAMES = Object.fromEntries(Object.entries(OP).map(([k, v]) => [v, k]));
+
+const MODELS = { HM1: 'instax mini LiPlay', FI017: 'instax mini Link', FI018: 'instax SQUARE Link', FI019: 'instax WIDE Link' };
+
+// LiPlay negotiates an ATT MTU of 185, so a single write carries at most 182 bytes.
+const WRITE_SIZE = 182;
+const DEFAULT_MAX_JPEG = 105 * 1024;
+
+const hex = (bytes) => Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join(' ');
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function encodeFrame(op, payload = []) {
+  const len = 7 + payload.length;
+  const f = new Uint8Array(len);
+  f[0] = 0x41; f[1] = 0x62;
+  f[2] = len >> 8; f[3] = len & 0xff;
+  f[4] = op >> 8; f[5] = op & 0xff;
+  f.set(payload, 6);
+  let sum = 0;
+  for (let i = 0; i < len - 1; i++) sum += f[i];
+  f[len - 1] = (255 - (sum & 255)) & 255;
+  return f;
+}
+
+const u32 = (n) => [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255];
+
+class InstaxPrinter extends EventTarget {
+  constructor(log) {
+    super();
+    this.log = log;
+    this.device = null;
+    this.write = null;
+    this.notify = null;
+    this.rx = new Uint8Array(0);
+    this.waiter = null;
+    this.chain = Promise.resolve();
+    this.verbose = false;
+    this.handleNotify = (e) => this.onData(e.target.value);
+  }
+
+  get connected() { return !!(this.device && this.device.gatt.connected && this.write); }
+
+  async connect() {
+    this.device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: 'INSTAX' }, { services: [SERVICE] }],
+      optionalServices: OPTIONAL_SERVICES,
+    });
+    this.log(`Selected ${this.device.name}`);
+    this.device.addEventListener('gattserverdisconnected', () => {
+      this.write = this.notify = null;
+      if (this.waiter) this.waiter.reject(new Error('Camera disconnected'));
+      this.log('Disconnected');
+      this.dispatchEvent(new Event('disconnected'));
+    });
+    // macOS often refuses the first GATT connection ("Unsupported device") while the
+    // camera is still settling after advertising, so retry a few times.
+    let lastError;
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      try {
+        await this.setup(attempt);
+        return;
+      } catch (e) {
+        lastError = e;
+        this.log(`Attempt ${attempt} failed: ${e.name}: ${e.message}`);
+        if (this.device.gatt.connected) this.device.gatt.disconnect();
+        await sleep(1500);
+      }
+    }
+    throw lastError;
+  }
+
+  async setup(attempt) {
+    const step = (label, promise, ms = 15000) => Promise.race([
+      promise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error(`timed out: ${label}`)), ms)),
+    ]);
+    this.log(`Connecting (attempt ${attempt})…`);
+    const server = await step('GATT connect', this.device.gatt.connect(), 20000);
+    this.log('GATT connected, looking up print service…');
+    const service = await step('find service', server.getPrimaryService(SERVICE));
+    this.write = await step('write characteristic', service.getCharacteristic(WRITE_CHAR));
+    this.notify = await step('notify characteristic', service.getCharacteristic(NOTIFY_CHAR));
+    this.notify.addEventListener('characteristicvaluechanged', this.handleNotify);
+    this.log('Enabling notifications…');
+    await step('start notifications', this.notify.startNotifications());
+    // The first command sent right after subscribing tends to go unanswered.
+    await sleep(500);
+    this.log('Connected, notifications on');
+  }
+
+  disconnect() {
+    if (this.device?.gatt.connected) this.device.gatt.disconnect();
+  }
+
+  // Replies can in principle arrive split across notifications, so reassemble by length.
+  onData(view) {
+    const chunk = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+    const merged = new Uint8Array(this.rx.length + chunk.length);
+    merged.set(this.rx); merged.set(chunk, this.rx.length);
+    this.rx = merged;
+    while (this.rx.length >= 4) {
+      if (this.rx[0] !== 0x61 || this.rx[1] !== 0x42) { this.rx = this.rx.slice(1); continue; }
+      const len = (this.rx[2] << 8) | this.rx[3];
+      if (len < 7 || len > 4096) { this.rx = this.rx.slice(1); continue; }
+      if (this.rx.length < len) break;
+      const frame = this.rx.slice(0, len);
+      this.rx = this.rx.slice(len);
+      this.onFrame(frame);
+    }
+  }
+
+  onFrame(f) {
+    let sum = 0;
+    for (const b of f) sum += b;
+    if ((sum & 255) !== 255) { this.log(`<- bad checksum: ${hex(f)}`); return; }
+    const reply = { op: (f[4] << 8) | f[5], status: f[6], data: f.slice(7, f.length - 1), raw: f };
+    const w = this.waiter;
+    if (w && w.op === reply.op) {
+      this.waiter = null;
+      clearTimeout(w.timer);
+      w.resolve(reply);
+    } else {
+      this.log(`<- unsolicited ${OP_NAMES[reply.op] ?? '0x' + reply.op.toString(16)} status=${reply.status}: ${hex(f)}`);
+      this.dispatchEvent(Object.assign(new Event('unsolicited'), { reply }));
+    }
+  }
+
+  // One command in flight at a time: replies are matched by opcode only.
+  request(op, payload = [], timeout = 5000) {
+    const run = this.chain.then(() => this.requestNow(op, payload, timeout));
+    this.chain = run.catch(() => {});
+    return run;
+  }
+
+  async requestNow(op, payload, timeout) {
+    if (!this.connected) throw new Error('Camera is not connected');
+    const frame = encodeFrame(op, payload);
+    const reply = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.waiter?.timer === timer) this.waiter = null;
+        reject(new Error(`No reply to ${OP_NAMES[op]} after ${timeout / 1000}s`));
+      }, timeout);
+      this.waiter = { op, resolve, reject, timer };
+    });
+    reply.catch(() => {});
+    if (this.verbose || op !== OP.DOWNLOAD_DATA) {
+      this.log(`-> ${OP_NAMES[op]} ${frame.length > 40 ? `(${frame.length} bytes)` : hex(frame)}`);
+    }
+    for (let i = 0; i < frame.length; i += WRITE_SIZE) {
+      const part = frame.subarray(i, i + WRITE_SIZE);
+      if (this.write.writeValueWithoutResponse) await this.write.writeValueWithoutResponse(part);
+      else await this.write.writeValue(part);
+    }
+    const r = await reply;
+    if (this.verbose || op !== OP.DOWNLOAD_DATA) this.log(`<- ${OP_NAMES[r.op]} status=${r.status} ${hex(r.data)}`);
+    return r;
+  }
+
+  async readString(index) {
+    const r = await this.request(OP.DEVICE_INFO, [index]);
+    // data: [index, length, ...ascii]
+    return String.fromCharCode(...r.data.slice(2)).replace(/\0/g, '').trim();
+  }
+
+  async info() {
+    const out = {};
+    for (let i = 0; i < 2 && !out.modelCode; i++) {
+      try { out.modelCode = await this.readString(1); } catch (e) { this.log(e.message); }
+    }
+    try { out.serial = await this.readString(2); } catch (e) { this.log(e.message); }
+
+    const img = await this.request(OP.FUNCTION_INFO, [0]);
+    // data: [0, w(2), h(2), ?, ?, maxSize(4)]
+    const d = img.data;
+    out.width = (d[1] << 8) | d[2];
+    out.height = (d[3] << 8) | d[4];
+    if (d.length >= 11) {
+      const max = ((d[7] << 24) | (d[8] << 16) | (d[9] << 8) | d[10]) >>> 0;
+      if (max > 0 && max !== 0xffffffff) out.maxJpeg = max;
+    }
+    Object.assign(out, await this.status());
+    return out;
+  }
+
+  async status() {
+    const out = {};
+    const batt = await this.request(OP.FUNCTION_INFO, [1]);
+    out.batteryState = batt.data[1];
+    out.battery = batt.data[2];
+    const fn = await this.request(OP.FUNCTION_INFO, [2]);
+    out.filmLeft = fn.data[1] & 0x0f;
+    out.charging = (fn.data[1] & 0x80) !== 0;
+    return out;
+  }
+
+  async cancel() {
+    try { await this.request(OP.DOWNLOAD_CANCEL, [], 3000); } catch (e) { this.log(`cancel: ${e.message}`); }
+  }
+
+  // Send the JPEG and (optionally) print it. onProgress(fraction, label)
+  async printJpeg(jpeg, { dryRun = false, onProgress = () => {} } = {}) {
+    onProgress(0, 'Starting transfer…');
+    let start;
+    try {
+      start = await this.request(OP.DOWNLOAD_START, [0x02, 0x00, 0x00, 0x00, ...u32(jpeg.length)], 8000);
+    } catch (e) {
+      if (!this.connected) throw e;
+      throw new Error('The camera didn\'t accept the photo. Make sure it is on the shooting screen (not a menu or playback), then try again.');
+    }
+    if (start.status !== 0) throw new Error(describeStatus(start.status, 'start'));
+
+    // The printer answers DOWNLOAD_START with the chunk size it wants.
+    // Fall back to 1808 (seen in LiPlay captures) if the reply is short.
+    let chunk = start.data.length >= 4
+      ? ((start.data[0] << 24) | (start.data[1] << 16) | (start.data[2] << 8) | start.data[3]) >>> 0
+      : 0;
+    if (!chunk || chunk > 4096) chunk = 1808;
+    const count = Math.ceil(jpeg.length / chunk);
+    this.log(`Sending ${jpeg.length} bytes as ${count} chunks of ${chunk}`);
+
+    try {
+      for (let i = 0; i < count; i++) {
+        const piece = new Uint8Array(chunk); // last chunk zero-padded
+        piece.set(jpeg.subarray(i * chunk, (i + 1) * chunk));
+        const r = await this.request(OP.DOWNLOAD_DATA, [...u32(i), ...piece], 8000);
+        if (r.status !== 0) throw new Error(describeStatus(r.status, 'data') + ` (chunk ${i + 1}/${count})`);
+        onProgress((i + 1) / count * 0.9, `Sending photo… ${i + 1}/${count}`);
+      }
+      const end = await this.request(OP.DOWNLOAD_END, [], 8000);
+      if (end.status !== 0) throw new Error(describeStatus(end.status, 'end'));
+    } catch (e) {
+      await this.cancel();
+      throw e;
+    }
+
+    if (dryRun) {
+      // The camera now holds the photo and waits for PRINT_IMAGE; tell it to drop it.
+      await this.cancel();
+      onProgress(1, 'Transfer finished. Test mode, so nothing was printed.');
+      return { printed: false };
+    }
+
+    onProgress(0.93, 'Printing…');
+    const pr = await this.request(OP.PRINT_IMAGE, [], 20000);
+    if (pr.status !== 0) throw new Error(describeStatus(pr.status, 'print'));
+    onProgress(1, 'Printing… the photo should be coming out now.');
+    return { printed: true };
+  }
+}
+
+function describeStatus(code, phase) {
+  const h = '0x' + code.toString(16).padStart(2, '0');
+  const known = {
+    0x01: 'The camera is busy. Wait a few seconds and try again.',
+    0x81: 'The photo file is too large for the camera.',
+  };
+  return `${known[code] ?? `The camera refused the ${phase} step`} (status ${h})`;
+}
+
+// ---------------------------------------------------------------------------
+// UI
+// ---------------------------------------------------------------------------
+const $ = (id) => document.getElementById(id);
+const logEl = $('log');
+function log(msg) {
+  const t = new Date().toLocaleTimeString([], { hour12: false });
+  logEl.textContent += `[${t}] ${msg}\n`;
+  logEl.scrollTop = logEl.scrollHeight;
+  console.log('[instax]', msg);
+}
+
+const printer = new InstaxPrinter(log);
+let printerInfo = null;
+let busy = false;
+
+function setStatus(text, kind = '') {
+  $('status').textContent = text;
+  $('status').className = kind;
+}
+function setProgress(f) { $('bar').style.width = `${Math.round(f * 100)}%`; }
+
+function checkSupport() {
+  const b = $('support');
+  let msg = '';
+  if (!window.isSecureContext) msg = 'Web Bluetooth needs a secure page. Open this through http://localhost (see the README) instead of a plain file or network address.';
+  else if (!navigator.bluetooth) msg = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+    ? 'Safari and other iPhone browsers have no Web Bluetooth. Install the free "Bluefy – Web BLE Browser" app from the App Store and open this page in it.'
+    : 'This browser has no Web Bluetooth. Use Chrome or Edge on macOS, Windows, Linux, ChromeOS or Android. Safari and Firefox don\'t support it.';
+  if (msg) { b.hidden = false; b.firstElementChild.textContent = msg; $('connect').disabled = true; }
+}
+
+function renderPrinter() {
+  const on = printer.connected;
+  $('connect').hidden = on;
+  $('disconnect').hidden = !on;
+  $('refresh').disabled = !on || busy;
+  $('dot').className = 'dot' + (on ? (busy ? ' busy' : ' on') : '');
+  $('conn').textContent = on ? (busy ? 'Working…' : 'Connected') : 'Not connected';
+  const i = printerInfo;
+  $('name').textContent = on && printer.device ? printer.device.name : '–';
+  $('model').textContent = i?.modelCode ? (MODELS[i.modelCode] ?? i.modelCode) : '–';
+  $('film').textContent = i?.filmLeft != null ? `${i.filmLeft} shot${i.filmLeft === 1 ? '' : 's'}` : '–';
+  $('batt').textContent = i?.battery != null ? `${i.battery}%${i.charging ? ' · charging' : ''}` : '–';
+  $('battbar').style.width = `${i?.battery ?? 0}%`;
+  $('size').textContent = i?.width ? `${i.width} × ${i.height}` : '–';
+  updatePrintButton();
+}
+
+function updatePrintButton() {
+  $('print').disabled = busy || !printer.connected || !img;
+  $('print').textContent = $('dry').checked ? 'Send test' : 'Print';
+}
+
+let connecting = false;
+$('connect').onclick = async () => {
+  if (connecting) return;
+  connecting = true;
+  $('connect').disabled = true;
+  $('connect').textContent = 'Connecting…';
+  try {
+    setStatus('Choose the camera in the browser dialog…');
+    await printer.connect();
+    busy = true; renderPrinter();
+    printerInfo = await printer.info();
+    log(`Info: ${JSON.stringify(printerInfo)}`);
+    if (printerInfo.width && printerInfo.height && (printerInfo.width !== OUT.w || printerInfo.height !== OUT.h)) {
+      OUT.w = printerInfo.width; OUT.h = printerInfo.height;
+      sizeCanvas(); draw();
+    }
+    setStatus(img ? 'Ready to print.' : 'Connected. Pick a photo.', 'ok');
+  } catch (e) {
+    if (e.name === 'NotFoundError') setStatus('No camera chosen.');
+    else {
+      log(`Connect failed: ${e.message}`);
+      setStatus(/unsupported device/i.test(e.message)
+        ? 'The camera dropped the connection. Turn it off and on, wait on the shooting screen, then connect once. '
+          + 'If it still fails, delete the registration in the camera\'s Bluetooth menu, forget INSTAX in this device\'s Bluetooth settings, and try again.'
+        : `Couldn't connect (${e.message}). Turn the camera off and on, make sure no phone is connected to it, then try again.`, 'err');
+    }
+    printer.disconnect();
+  } finally {
+    connecting = false;
+    $('connect').disabled = false;
+    $('connect').textContent = 'Connect';
+    busy = false; renderPrinter();
+  }
+};
+$('disconnect').onclick = () => printer.disconnect();
+printer.addEventListener('disconnected', () => { printerInfo = null; busy = false; renderPrinter(); });
+$('refresh').onclick = async () => {
+  busy = true; renderPrinter();
+  try { Object.assign(printerInfo ??= {}, await printer.status()); }
+  catch (e) { setStatus(e.message, 'err'); }
+  busy = false; renderPrinter();
+};
+$('verbose').onchange = (e) => { printer.verbose = e.target.checked; };
+$('dry').onchange = updatePrintButton;
+$('copylog').onclick = () => navigator.clipboard.writeText(logEl.textContent);
+
+// ---------------------------------------------------------------------------
+// Image editor. Renders straight into the printer's native resolution.
+// ---------------------------------------------------------------------------
+const OUT = { w: 600, h: 800 };
+const canvas = $('preview');
+const ctx = canvas.getContext('2d');
+let img = null;
+const view = { zoom: 1, rot: 0, dx: 0, dy: 0, mode: 'fill', bg: '#ffffff', bright: 100, contrast: 100, sat: 100 };
+
+function sizeCanvas() {
+  canvas.width = OUT.w; canvas.height = OUT.h;
+  const cssW = 228;
+  canvas.style.width = cssW + 'px';
+  canvas.style.height = Math.round(cssW * OUT.h / OUT.w) + 'px';
+}
+
+function render(target, w, h) {
+  const c = target.getContext('2d');
+  c.save();
+  c.fillStyle = view.bg;
+  c.fillRect(0, 0, w, h);
+  if (img) {
+    const turned = view.rot % 180 !== 0;
+    const iw = turned ? img.height : img.width;
+    const ih = turned ? img.width : img.height;
+    const base = view.mode === 'fill' ? Math.max(w / iw, h / ih) : Math.min(w / iw, h / ih);
+    const s = base * view.zoom;
+    c.filter = `brightness(${view.bright}%) contrast(${view.contrast}%) saturate(${view.sat}%)`;
+    c.imageSmoothingQuality = 'high';
+    c.translate(w / 2 + view.dx * w, h / 2 + view.dy * h);
+    c.rotate(view.rot * Math.PI / 180);
+    c.scale(s, s);
+    c.drawImage(img, -img.width / 2, -img.height / 2);
+  }
+  c.restore();
+}
+
+function draw() { render(canvas, OUT.w, OUT.h); }
+
+function resetView(keepTone = false) {
+  Object.assign(view, { zoom: 1, dx: 0, dy: 0, rot: 0, mode: 'fill' });
+  if (!keepTone) Object.assign(view, { bright: 100, contrast: 100, sat: 100 });
+  // A landscape photo prints better turned sideways than cropped to a sliver.
+  if (img && img.width > img.height * 1.15) view.rot = 90;
+  syncControls(); draw();
+}
+
+function syncControls() {
+  $('zoom').value = view.zoom; $('zoomv').textContent = view.zoom.toFixed(1) + '×';
+  for (const k of ['bright', 'contrast', 'sat']) { $(k).value = view[k]; $(k + 'v').textContent = view[k]; }
+  $('fill').setAttribute('aria-pressed', view.mode === 'fill');
+  $('fit').setAttribute('aria-pressed', view.mode === 'fit');
+  document.querySelectorAll('[data-bg]').forEach((b) => b.setAttribute('aria-pressed', b.dataset.bg === view.bg));
+}
+
+async function loadFile(file) {
+  if (!file || !file.type.startsWith('image/')) return;
+  try {
+    // An <img> applies EXIF orientation in every current browser, so phone photos come in upright.
+    const url = URL.createObjectURL(file);
+    try {
+      img = await new Promise((resolve, reject) => {
+        const el = new Image();
+        el.onload = () => resolve(el);
+        el.onerror = () => reject(new Error('unsupported format'));
+        el.src = url;
+      });
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+    resetView(true);
+    setStatus(printer.connected ? 'Ready to print.' : 'Photo loaded. Connect the camera to print.');
+    updatePrintButton();
+  } catch (e) {
+    setStatus(`Couldn't read that image (${e.message}). HEIC photos may need converting to JPEG first.`, 'err');
+  }
+}
+
+$('drop').onclick = () => $('file').click();
+$('file').onchange = (e) => loadFile(e.target.files[0]);
+for (const ev of ['dragenter', 'dragover']) document.addEventListener(ev, (e) => { e.preventDefault(); $('drop').classList.add('over'); });
+for (const ev of ['dragleave', 'drop']) document.addEventListener(ev, (e) => { e.preventDefault(); $('drop').classList.remove('over'); });
+document.addEventListener('drop', (e) => loadFile(e.dataTransfer.files[0]));
+document.addEventListener('paste', (e) => {
+  const item = [...e.clipboardData.items].find((i) => i.type.startsWith('image/'));
+  if (item) loadFile(item.getAsFile());
+});
+
+$('zoom').oninput = (e) => { view.zoom = +e.target.value; syncControls(); draw(); };
+for (const k of ['bright', 'contrast', 'sat']) $(k).oninput = (e) => { view[k] = +e.target.value; syncControls(); draw(); };
+$('fill').onclick = () => { view.mode = 'fill'; syncControls(); draw(); };
+$('fit').onclick = () => { view.mode = 'fit'; syncControls(); draw(); };
+$('rotate').onclick = () => { view.rot = (view.rot + 90) % 360; draw(); };
+$('reset').onclick = () => resetView();
+document.querySelectorAll('[data-bg]').forEach((b) => b.onclick = () => { view.bg = b.dataset.bg; syncControls(); draw(); });
+
+let drag = null;
+let pinch = null;
+const pointers = new Map();
+const spread = () => { const [a, b] = [...pointers.values()]; return Math.hypot(a.x - b.x, a.y - b.y); };
+canvas.addEventListener('pointerdown', (e) => {
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  canvas.setPointerCapture(e.pointerId); canvas.classList.add('dragging');
+  if (pointers.size === 2) { drag = null; pinch = { d: spread(), zoom: view.zoom }; }
+  else if (pointers.size === 1) drag = { x: e.clientX, y: e.clientY, dx: view.dx, dy: view.dy };
+});
+canvas.addEventListener('pointermove', (e) => {
+  if (!pointers.has(e.pointerId)) return;
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (pinch && pointers.size === 2) {
+    view.zoom = Math.min(4, Math.max(1, pinch.zoom * spread() / pinch.d));
+    syncControls(); draw();
+  } else if (drag) {
+    const r = canvas.getBoundingClientRect();
+    view.dx = drag.dx + (e.clientX - drag.x) / r.width;
+    view.dy = drag.dy + (e.clientY - drag.y) / r.height;
+    draw();
+  }
+});
+const endDrag = (e) => {
+  pointers.delete(e.pointerId);
+  pinch = null;
+  drag = null;
+  if (pointers.size === 0) canvas.classList.remove('dragging');
+};
+canvas.addEventListener('pointerup', endDrag);
+canvas.addEventListener('pointercancel', endDrag);
+canvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  view.zoom = Math.min(4, Math.max(1, view.zoom * Math.exp(-e.deltaY * 0.002)));
+  syncControls(); draw();
+}, { passive: false });
+
+// Find the highest JPEG quality that fits the camera's size limit.
+async function encodeJpeg(maxBytes) {
+  const out = document.createElement('canvas');
+  out.width = OUT.w; out.height = OUT.h;
+  render(out, OUT.w, OUT.h);
+  const at = (q) => new Promise((res) => out.toBlob((b) => res(b), 'image/jpeg', q));
+  let lo = 0.3, hi = 0.97, best = await at(lo);
+  const top = await at(hi);
+  if (top.size <= maxBytes) best = top;
+  else {
+    for (let i = 0; i < 7; i++) {
+      const q = (lo + hi) / 2;
+      const b = await at(q);
+      if (b.size <= maxBytes) { best = b; lo = q; } else hi = q;
+    }
+  }
+  return new Uint8Array(await best.arrayBuffer());
+}
+
+$('print').onclick = async () => {
+  if (busy) return;
+  const dryRun = $('dry').checked;
+  if (!dryRun && printerInfo?.filmLeft === 0) {
+    setStatus('The camera reports no film left. Load a new pack, then click Refresh status.', 'err');
+    return;
+  }
+  busy = true; renderPrinter(); setProgress(0);
+  try {
+    const maxBytes = printerInfo?.maxJpeg ? Math.min(printerInfo.maxJpeg, DEFAULT_MAX_JPEG) : DEFAULT_MAX_JPEG;
+    const jpeg = await encodeJpeg(maxBytes);
+    log(`Encoded JPEG ${OUT.w}x${OUT.h}, ${(jpeg.length / 1024).toFixed(1)} KB`);
+    const t0 = performance.now();
+    const res = await printer.printJpeg(jpeg, {
+      dryRun,
+      onProgress: (f, label) => { setProgress(f); setStatus(label); },
+    });
+    log(`Done in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+    if (res.printed) {
+      setStatus('Printing… the photo should be coming out now.', 'ok');
+      await sleep(12000);
+      try { Object.assign(printerInfo, await printer.status()); } catch {}
+      setStatus(`Printed. ${printerInfo?.filmLeft ?? '?'} shots left.`, 'ok');
+    } else {
+      setStatus('Test transfer succeeded. Untick "Test transfer only" to print for real.', 'ok');
+    }
+  } catch (e) {
+    log(`Print failed: ${e.message}`);
+    setStatus(e.message, 'err');
+    setProgress(0);
+  } finally {
+    busy = false; renderPrinter();
+  }
+};
+
+checkSupport();
+sizeCanvas();
+syncControls();
+draw();
+renderPrinter();
+</script>
+</body>
+</html>
