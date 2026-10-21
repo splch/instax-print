@@ -24,6 +24,10 @@ The camera remembers one device. When switching devices, or after a failed sessi
 2. Forget the INSTAX device in the computer's or phone's Bluetooth settings.
 3. Turn the camera off and on, then connect again.
 
+## Try it without a camera
+
+Add `?demo` to the URL for a simulated camera: https://splch.github.io/instax-print/?demo
+
 ## Run locally
 
     python3 -m http.server 8765 --bind 127.0.0.1
