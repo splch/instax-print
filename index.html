@@ -622,6 +622,7 @@ class InstaxPrinter extends EventTarget {
   //   onRetry(kind)            before a retry: a pace name, or 'lighter'
   //   shrink(reason, size, acked)  a smaller encoding of the same photo, or null when none would look right
   async printJpeg(jpeg, { dryRun = false, onProgress = () => {}, onRetry = () => {}, shrink = async () => null } = {}) {
+    let lastStall = -1;
     for (;;) {
       try {
         await this.transfer(jpeg, onProgress);
@@ -641,15 +642,22 @@ class InstaxPrinter extends EventTarget {
         // Give the camera time to give up on any half-received frame before cancelling.
         await sleep(1500);
         await this.cancel();
-        if (this.pace < PACES.length - 1) {
+        // Stalling twice at the same point, after the first chunks went through, is the
+        // camera running out of room rather than the link dropping writes.
+        const acked = e.acked ?? 0;
+        const sizeLimited = acked > 0 && acked === lastStall;
+        lastStall = acked;
+        if (this.pace < PACES.length - 1 && !sizeLimited) {
           this.pace++;
           this.log(`Retrying at ${PACES[this.pace].name} pace`);
           onRetry(PACES[this.pace].name);
         } else {
-          // Every pace failed at this size; a lighter file is the last resort.
-          const smaller = await shrink('stalled', jpeg.length, e.acked ?? 0);
+          // A lighter file is the last resort: every pace failed, or the camera's memory is full.
+          if (sizeLimited && this.pace > 0) this.pace--; // the slower pace wasn't the fix
+          const smaller = await shrink('stalled', jpeg.length, acked);
           if (!smaller) throw new Error('The camera stopped responding while receiving the photo.');
           jpeg = smaller;
+          lastStall = -1;
           onRetry('lighter');
         }
         onProgress(0);
@@ -1033,11 +1041,11 @@ async function print() {
     app.preparing = false; renderCta();
 
     const shrink = async (reason, size, acked = 0) => {
-      if (!DEMO) store.set('sizeLimit', size - 1);
-      let budget = Math.floor(size * SHRINK_STEP);
-      // A stall tens of KB in, at every pace, looks like the camera's memory filling up:
-      // go straight under that point rather than stepping down through slow failures.
-      if (acked >= 32 * 1024) budget = Math.min(budget, Math.floor(acked * 0.95));
+      // A stall tens of KB in looks like the camera's memory filling up: go straight
+      // under that point (and remember it) rather than stepping down through slow failures.
+      const memory = acked >= 32 * 1024 ? acked : Infinity;
+      if (!DEMO) store.set('sizeLimit', Math.min(size - 1, memory));
+      const budget = Math.min(Math.floor(size * SHRINK_STEP), Math.floor(memory * 0.95));
       const next = await enc.best(budget);
       if (!next.fits || next.fidelity < PRINT_FIDELITY_FLOOR) {
         log(`Not shrinking further: ${describeEncoding(next)} would be visible on the print`);
