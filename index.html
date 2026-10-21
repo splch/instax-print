@@ -339,6 +339,7 @@
     <div class="group">
       <label class="row"><span>Date stamp<small>A retro orange date in the corner.</small></span><input type="checkbox" class="switch" id="dateToggle"></label>
       <label class="row"><span>Test mode<small>Sends the photo without printing. No film used.</small></span><input type="checkbox" class="switch" id="dry"></label>
+      <div class="row"><span>Learned for this camera<small id="sLearned">Nothing yet</small></span><button class="link" id="resetLearned">Reset</button></div>
       <div class="row"><span>Border in Fit mode</span>
         <span class="chips"><button data-bg="#ffffff" aria-pressed="true">White</button><button data-bg="#000000" aria-pressed="false">Black</button></span>
       </div>
@@ -393,9 +394,8 @@ const MODELS = { HM1: 'instax mini LiPlay', FI017: 'instax mini Link', FI018: 'i
 
 // LiPlay negotiates an ATT MTU of 185, so a single write carries at most 182 bytes.
 const WRITE_SIZE = 182;
-// The official Android app keeps photos under ~65 KB. Smaller transfers finish sooner and
-// leave fewer chances for a dropped write, with no visible loss at 600x800.
-const DEFAULT_MAX_JPEG = 64 * 1024;
+// There is no fixed size cap. Photos start at the highest quality and only shrink when the
+// camera rejects the size or every write pace has failed (see PhotoEncoder).
 
 // How image data is pushed, from fastest to safest. iOS silently drops
 // write-without-response packets when its buffer fills, so a stalled transfer is
@@ -412,6 +412,8 @@ const PACES = [
 
 // A refusal from the camera itself; retrying the same photo won't change its answer.
 class CameraRefusal extends Error {}
+// The camera's explicit "file too large" answer to DOWNLOAD_START (status 0x81).
+class TooLarge extends CameraRefusal {}
 
 const hex = (bytes) => Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join(' ');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -615,22 +617,41 @@ class InstaxPrinter extends EventTarget {
     try { await this.request(OP.DOWNLOAD_CANCEL, [], 3000); } catch (e) { this.log(`cancel: ${e.message}`); }
   }
 
-  // Send the JPEG and (optionally) print it. onProgress(fraction); onRetry(paceName) before a slower retry.
-  async printJpeg(jpeg, { dryRun = false, onProgress = () => {}, onRetry = () => {} } = {}) {
+  // Send the JPEG and (optionally) print it.
+  //   onProgress(fraction)
+  //   onRetry(kind)            before a retry: a pace name, or 'lighter'
+  //   shrink(reason, size, acked)  a smaller encoding of the same photo, or null when none would look right
+  async printJpeg(jpeg, { dryRun = false, onProgress = () => {}, onRetry = () => {}, shrink = async () => null } = {}) {
     for (;;) {
       try {
         await this.transfer(jpeg, onProgress);
         break;
       } catch (e) {
+        if (e instanceof TooLarge) {
+          // Nothing has been sent yet, so a smaller file can go straight away at the same pace.
+          this.log(`Camera rejected ${jpeg.length} bytes as too large`);
+          const smaller = await shrink('too-large', jpeg.length);
+          if (!smaller) throw new CameraRefusal('This photo is too detailed for the camera to accept without visible loss.');
+          jpeg = smaller;
+          onRetry('lighter');
+          continue;
+        }
         if (e instanceof CameraRefusal || !this.connected) throw e;
         this.log(`Transfer stalled at ${PACES[this.pace].name} pace: ${e.message}`);
         // Give the camera time to give up on any half-received frame before cancelling.
         await sleep(1500);
         await this.cancel();
-        if (this.pace >= PACES.length - 1) throw new Error('The camera stopped responding while receiving the photo.');
-        this.pace++;
-        this.log(`Retrying at ${PACES[this.pace].name} pace`);
-        onRetry(PACES[this.pace].name);
+        if (this.pace < PACES.length - 1) {
+          this.pace++;
+          this.log(`Retrying at ${PACES[this.pace].name} pace`);
+          onRetry(PACES[this.pace].name);
+        } else {
+          // Every pace failed at this size; a lighter file is the last resort.
+          const smaller = await shrink('stalled', jpeg.length, e.acked ?? 0);
+          if (!smaller) throw new Error('The camera stopped responding while receiving the photo.');
+          jpeg = smaller;
+          onRetry('lighter');
+        }
         onProgress(0);
         await sleep(800);
       }
@@ -664,6 +685,7 @@ class InstaxPrinter extends EventTarget {
       if (start.status === 0x01 && tries < 3) { await sleep(1500); continue; }
       break;
     }
+    if (start.status === 0x81) throw new TooLarge(describeStatus(start.status, 'start'));
     if (start.status !== 0) throw new CameraRefusal(describeStatus(start.status, 'start'));
 
     // The printer answers DOWNLOAD_START with the chunk size it wants.
@@ -682,7 +704,7 @@ class InstaxPrinter extends EventTarget {
       try {
         r = await this.request(OP.DOWNLOAD_DATA, [...u32(i), ...piece], 6000);
       } catch (e) {
-        throw new Error(`no reply to chunk ${i + 1}/${count}`);
+        throw Object.assign(new Error(`no reply to chunk ${i + 1}/${count}`), { acked: i * chunk });
       }
       if (r.status !== 0) throw new Error(describeStatus(r.status, 'data') + ` (chunk ${i + 1}/${count})`);
       if (i === 0) this.log(`Chunk 1 acknowledged at ${PACES[this.pace].name} pace`);
@@ -863,6 +885,10 @@ function render() {
   $('sDots').innerHTML = i?.filmLeft != null ? Array.from({ length: 10 }, (_, n) => `<i class="${n < i.filmLeft ? 'on' : ''}" style="--i:${n}"></i>`).join('') : '';
   $('sBatt').textContent = i?.battery != null ? `${i.battery}%${i.charging ? ' · charging' : ''}` : '–';
   $('camActions').hidden = !on;
+  const limit = store.get('sizeLimit', null);
+  const pace = store.get('pace', 0);
+  $('sLearned').textContent = !limit && !pace ? 'Full quality, fastest sending'
+    : `${PACES[pace]?.name ?? 'fast'} sending${limit ? ` · photos under ${Math.round(limit / 1024)} KB` : ' · full quality'}`;
   $('dry').checked = app.dry;
   document.querySelectorAll('[data-bg]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.bg === view.bg)));
 
@@ -886,6 +912,7 @@ function renderCta() {
 
   if (!SUPPORTED) label = IOS ? 'Get Bluefy' : 'Open in Chrome';
   else if (app.phase === 'connecting') { label = `<span class="ping">${ICON.bt}</span>Connecting…`; disabled = true; }
+  else if (app.phase === 'sending' && app.preparing) label = `${ICON.spin}Preparing…`;
   else if (app.phase === 'sending') label = `Sending ${Math.min(100, Math.round(app.progress / 0.9 * 100))}%`;
   else if (app.phase === 'printing') label = `${ICON.spin}Printing…`;
   else if (app.phase === 'done') label = `${ICON.check}${app.dry ? 'Test sent' : 'Printed'}`;
@@ -931,6 +958,7 @@ function renderNote() {
   const i = app.info;
   if (app.phase !== 'idle') {
     note.textContent = app.phase === 'printing' ? 'Your photo is developing.'
+      : app.retrying === 'lighter' ? 'Sending a lighter version that will still print identically…'
       : app.retrying ? 'Bluetooth hiccup. Resending more carefully…' : 'Keep the camera close.';
     return;
   }
@@ -996,20 +1024,42 @@ async function print() {
   render();
   holdScreen(true);
   try {
-    const maxBytes = app.info?.maxJpeg ? Math.min(app.info.maxJpeg, DEFAULT_MAX_JPEG) : DEFAULT_MAX_JPEG;
-    const jpeg = await encodeJpeg(maxBytes);
-    log(`Encoded JPEG ${OUT.w}x${OUT.h}, ${(jpeg.length / 1024).toFixed(1)} KB`);
+    app.preparing = true; renderCta();
+    const enc = new PhotoEncoder();
+    // Start under any limit the camera has stated or shown before; otherwise no limit.
+    const known = Math.min(app.info?.maxJpeg ?? Infinity, store.get('sizeLimit', null) ?? Infinity);
+    let current = await enc.best(known);
+    log(`Encoded ${OUT.w}x${OUT.h}: ${describeEncoding(current)}`);
+    app.preparing = false; renderCta();
+
+    const shrink = async (reason, size, acked = 0) => {
+      if (!DEMO) store.set('sizeLimit', size - 1);
+      let budget = Math.floor(size * SHRINK_STEP);
+      // A stall tens of KB in, at every pace, looks like the camera's memory filling up:
+      // go straight under that point rather than stepping down through slow failures.
+      if (acked >= 32 * 1024) budget = Math.min(budget, Math.floor(acked * 0.95));
+      const next = await enc.best(budget);
+      if (!next.fits || next.fidelity < PRINT_FIDELITY_FLOOR) {
+        log(`Not shrinking further: ${describeEncoding(next)} would be visible on the print`);
+        return null;
+      }
+      log(`Lighter version: ${describeEncoding(next)}`);
+      current = next;
+      return next.bytes;
+    };
+
     const t0 = performance.now();
-    const res = await printer.printJpeg(jpeg, {
+    const res = await printer.printJpeg(current.bytes, {
+      shrink,
       dryRun: dry,
       onProgress: (f) => {
         app.progress = f;
         $('scan').style.setProperty('--p', `${Math.min(100, f / 0.9 * 100)}%`);
         renderCta();
       },
-      onRetry: () => { app.retrying = true; renderNote(); pulse(film, 'shake'); },
+      onRetry: (kind) => { app.retrying = kind; renderNote(); pulse(film, 'shake'); },
     });
-    log(`Sent in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+    log(`Sent ${(current.bytes.length / 1024).toFixed(1)} KB in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
     if (!DEMO) store.set('pace', printer.pace);
 
     film.classList.remove('sending');
@@ -1033,6 +1083,7 @@ async function print() {
     film.classList.remove('sending');
     pulse(film, 'shake');
   } finally {
+    app.preparing = false;
     film.classList.remove('printing', 'sending');
     film.classList.add('done');
     setTimeout(() => film.classList.remove('done'), 50);
@@ -1060,6 +1111,7 @@ $('refresh').onclick = async () => {
   render();
 };
 $('disconnect').onclick = () => { printer.disconnect(); sheet.close(); };
+$('resetLearned').onclick = () => { store.set('sizeLimit', null); store.set('pace', 0); if (!DEMO) printer.pace = 0; render(); };
 $('copylog').onclick = (e) => { e.preventDefault(); navigator.clipboard?.writeText(logEl.textContent); e.target.textContent = 'Copied'; setTimeout(() => (e.target.textContent = 'Copy'), 1500); };
 document.querySelectorAll('[data-bg]').forEach((b) => b.onclick = () => { view.bg = b.dataset.bg; store.set('bg', view.bg); draw(); updateThumbs(); render(); });
 
@@ -1130,6 +1182,27 @@ function drawDate(c, w, h) {
   c.restore();
 }
 
+// Halving steps of the photo, so no single draw shrinks it more than 2x. One big jump
+// (a 12 MP photo straight to 600x800) aliases fine detail in some browsers.
+let levels = [];
+function buildLevels(src) {
+  const out = [{ src, w: src.naturalWidth, h: src.naturalHeight }];
+  let prev = src, w = src.naturalWidth, h = src.naturalHeight;
+  // iOS caps a canvas near 16.7 MP, so the first step may need to be bigger than 2x.
+  let scale = Math.min(0.5, Math.sqrt(16e6 / (w * h)));
+  while (Math.min(w, h) * scale >= 200) {
+    const c = document.createElement('canvas');
+    c.width = Math.round(w * scale); c.height = Math.round(h * scale);
+    const g = c.getContext('2d');
+    g.imageSmoothingEnabled = true;
+    g.imageSmoothingQuality = 'high';
+    g.drawImage(prev, 0, 0, c.width, c.height);
+    out.push({ src: c, w: c.width, h: c.height });
+    prev = c; w = c.width; h = c.height; scale = 0.5;
+  }
+  return out;
+}
+
 function render2d(target, w, h, look, withDate) {
   const c = target.getContext('2d', { willReadFrequently: true });
   c.setTransform(1, 0, 0, 1, 0, 0);
@@ -1140,13 +1213,17 @@ function render2d(target, w, h, look, withDate) {
     const ih = turned ? img.naturalWidth : img.naturalHeight;
     const base = view.mode === 'fill' ? Math.max(w / iw, h / ih) : Math.min(w / iw, h / ih);
     const s = base * view.zoom;
+    // The smallest level that still has at least as many pixels as this draw needs.
+    let level = levels[0] ?? { src: img, w: img.naturalWidth, h: img.naturalHeight };
+    for (const l of levels) { if (s * img.naturalWidth / l.w <= 1) level = l; else break; }
+    const ls = s * img.naturalWidth / level.w;
     c.save();
     c.imageSmoothingEnabled = true;
     c.imageSmoothingQuality = 'high';
     c.translate(w / 2 + view.dx * w, h / 2 + view.dy * h);
     c.rotate(view.rot * Math.PI / 180);
-    c.scale(s, s);
-    c.drawImage(img, -img.naturalWidth / 2, -img.naturalHeight / 2);
+    c.scale(ls, ls);
+    c.drawImage(level.src, -level.w / 2, -level.h / 2);
     c.restore();
     applyTone(c, w, h, look);
   }
@@ -1217,6 +1294,7 @@ async function loadFile(file) {
       el.src = url;
     });
     app.error = null;
+    levels = buildLevels(img);
     resetView();
     pulse(canvas, 'fresh');
     pulse($('film'), 'hop');
@@ -1298,24 +1376,107 @@ canvas.addEventListener('wheel', (e) => {
   draw(); updateThumbs();
 }, { passive: false });
 
-// Find the highest JPEG quality that fits the camera's size limit.
-async function encodeJpeg(maxBytes) {
-  const out = document.createElement('canvas');
-  out.width = OUT.w; out.height = OUT.h;
-  render2d(out, OUT.w, OUT.h, lookById(view.look), store.get('date', false));
-  const at = (q) => new Promise((res) => out.toBlob((b) => res(b), 'image/jpeg', q));
-  let lo = 0.3, hi = 0.97, best = await at(lo);
-  const top = await at(hi);
-  if (top.size <= maxBytes) best = top;
-  else {
-    for (let i = 0; i < 7; i++) {
-      const q = (lo + hi) / 2;
-      const b = await at(q);
-      if (b.size <= maxBytes) { best = b; lo = q; } else hi = q;
+// ---------------------------------------------------------------------------
+// Encoding: the best JPEG the camera will take, shrinking only when it has to
+// ---------------------------------------------------------------------------
+const MIN_QUALITY = 30;
+const SHRINK_STEP = 0.75;
+// How close the compressed photo must stay to the original *as it will look on film*:
+// PSNR after both are softened like an instax print (see printView). 40 dB is the
+// usual threshold for differences people can't see.
+const PRINT_FIDELITY_FLOOR = 40;
+
+// MozJPEG (vendored, Apache-2.0) beats the browser's encoder at every size. Baseline,
+// not progressive, since that's what the camera's decoder is known to accept.
+let mozjpeg = null;
+const mozReady = import('./vendor/mozjpeg/encode.js')
+  .then((m) => { mozjpeg = m.default; return true; })
+  .catch((e) => { log(`MozJPEG unavailable (${e.message}); using the browser's encoder`); return false; });
+const mozOptions = (quality) => ({ quality, baseline: true, progressive: false, optimize_coding: true, arithmetic: false });
+
+// Soften an image roughly the way the film does: two [1 2 1] passes, about a 1px Gaussian.
+function printView(rgba, w, h) {
+  const planes = [0, 1, 2].map(() => new Float32Array(w * h));
+  for (let p = 0, i = 0; p < w * h; p++, i += 4) { planes[0][p] = rgba[i]; planes[1][p] = rgba[i + 1]; planes[2][p] = rgba[i + 2]; }
+  const tmp = new Float32Array(w * h);
+  for (const ch of planes) {
+    for (let pass = 0; pass < 2; pass++) {
+      for (let y = 0; y < h; y++) {
+        const r = y * w;
+        for (let x = 0; x < w; x++) tmp[r + x] = (ch[r + Math.max(0, x - 1)] + 2 * ch[r + x] + ch[r + Math.min(w - 1, x + 1)]) / 4;
+      }
+      for (let y = 0; y < h; y++) {
+        const u = Math.max(0, y - 1) * w, r = y * w, d = Math.min(h - 1, y + 1) * w;
+        for (let x = 0; x < w; x++) ch[r + x] = (tmp[u + x] + 2 * tmp[r + x] + tmp[d + x]) / 4;
+      }
     }
   }
-  return new Uint8Array(await best.arrayBuffer());
+  return planes;
 }
+
+function psnr(a, b) {
+  let se = 0, n = 0;
+  for (let c = 0; c < 3; c++) {
+    const x = a[c], y = b[c];
+    for (let i = 0; i < x.length; i++) { const d = x[i] - y[i]; se += d * d; }
+    n += x.length;
+  }
+  return se === 0 ? 99 : 10 * Math.log10(255 * 255 / (se / n));
+}
+
+async function decodeJpeg(bytes, w, h) {
+  const bmp = await createImageBitmap(new Blob([bytes], { type: 'image/jpeg' }));
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const g = c.getContext('2d', { willReadFrequently: true });
+  g.drawImage(bmp, 0, 0);
+  bmp.close?.();
+  return g.getImageData(0, 0, w, h).data;
+}
+
+class PhotoEncoder {
+  constructor() {
+    this.canvas = document.createElement('canvas');
+    this.canvas.width = OUT.w; this.canvas.height = OUT.h;
+    render2d(this.canvas, OUT.w, OUT.h, lookById(view.look), store.get('date', false));
+    this.pixels = this.canvas.getContext('2d').getImageData(0, 0, OUT.w, OUT.h);
+    this.files = new Map();
+    this.reference = null;
+  }
+
+  at(q) {
+    if (!this.files.has(q)) {
+      this.files.set(q, (async () => {
+        if (await mozReady) return new Uint8Array(await mozjpeg(this.pixels, mozOptions(q)));
+        const blob = await new Promise((r) => this.canvas.toBlob(r, 'image/jpeg', q / 100));
+        return new Uint8Array(await blob.arrayBuffer());
+      })());
+    }
+    return this.files.get(q);
+  }
+
+  // The highest whole-number quality whose file fits the budget (Infinity = no limit).
+  async best(budget = Infinity) {
+    let q = 100;
+    if ((await this.at(100)).length > budget) {
+      let lo = MIN_QUALITY, hi = 99;
+      q = MIN_QUALITY;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if ((await this.at(mid)).length <= budget) { q = mid; lo = mid + 1; } else hi = mid - 1;
+      }
+    }
+    const bytes = await this.at(q);
+    return { q, bytes, fits: bytes.length <= budget, fidelity: await this.fidelity(bytes) };
+  }
+
+  async fidelity(bytes) {
+    this.reference ??= printView(this.pixels.data, OUT.w, OUT.h);
+    return psnr(this.reference, printView(await decodeJpeg(bytes, OUT.w, OUT.h), OUT.w, OUT.h));
+  }
+}
+
+const describeEncoding = (r) => `${mozjpeg ? 'MozJPEG' : 'browser JPEG'} q${r.q}, ${(r.bytes.length / 1024).toFixed(1)} KB, print fidelity ${r.fidelity.toFixed(1)} dB`;
 
 $('dateToggle').checked = store.get('date', false);
 $('dateToggle').onchange = (e) => { store.set('date', e.target.checked); draw(); };
